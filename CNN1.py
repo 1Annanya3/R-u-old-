@@ -6,9 +6,9 @@ import torchvision.transforms as transforms
 from pathlib import Path
 import torch
 from torch.utils.data import random_split, DataLoader
-# import torch.nn as nn
+import torch.nn as nn
 import torch.nn.functional as F
-# import torch.optim as optim
+import torch.optim as optim
 
 #parameters
 # lr = 0.0002
@@ -60,61 +60,24 @@ imshow(torchvision.utils.make_grid(pics))
 
 
 #after the last convolution layer, flatten output then pass it onto fully connected layer
-"""
-class FaceModel(nn.Module):
-    def __init__(self, in_channels):
-        # call the parent constructor
-        super(FaceModel, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=90, kernel_size=3, stride=1, padding=1)
-        self.relu1 = nn.ReLU()
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=1, padding=1)
-        self.relu2 = nn.ReLU()
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+class CNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
 
     def forward(self, x):
-    x = self.l1(x)
-        x = F.relu(x)
-        x = self.dropout1(x)
-        x = self.l2(x)
-        x = F.relu(x)
-        x = self.dropout2(x)
-        return output
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = torch.flatten(x, 1) # flatten all dimensions except batch
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
-model = FaceModel()
-
-for epoch in range(2):
-
-    running_loss = 0.0
-    for i, data in enumerate(trainloader, 0):
-        inputs, labels = data
-
-        optimizer.zero_grad()
-
-        outputs = net(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss.item()
-        if i % 2000 == 1999:
-            print('[%d, %5d] loss: %.3f' %
-                  (epoch + 1, i + 1, running_loss / 2000))
-            running_loss = 0.0
-
-print('Finished Training')
-
-correct = 0
-total = 0
-with torch.no_grad():
-    for data in testloader:
-        images, labels = data
-        outputs = net(images)
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-
-print('Accuracy of the network on the 10000 test images: %d %%' % (
-    100 * correct / total))
-
-"""
+model = CNN()
