@@ -1,144 +1,325 @@
-# Python 3.x: Balance operator console (inputs -> MQTT commands, results -> Sheets)
-import ssl
-import json
-import gspread
-import paho.mqtt.client as mqtt
+// Balance Test with MPU6050 + MQTT Integration (Multi-Trial Fixed)
+// Set DEBUG to 1 for troubleshooting, 0 for production/standalone
+#define DEBUG 1  // Change to 0 to disable all serial output
 
-BROKER = "broker.hivemq.com"
-PORT   = 8883
+#if DEBUG
+  #define DEBUG_PRINT(x) Serial.print(x)
+  #define DEBUG_PRINTLN(x) Serial.println(x)
+  #define DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+  #define DEBUG_PRINT(x)
+  #define DEBUG_PRINTLN(x)
+  #define DEBUG_PRINTF(...)
+#endif
 
-TOPIC_CMD  = "cs3237/A0277110N/balance/cmd"   # to ESP32
-TOPIC_DATA = "cs3237/A0277110N/balance/data"  # from ESP32
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
-SERVICE_ACCOUNT_FILE = "service_account.json"
-SPREADSHEET_NAME     = "CS3237_Health_Assessment_Data"
+// WiFi Configuration
+const char* ssid = "ANNANYA";
+const char* password = ".";
 
-gc = None
-worksheet = None
+// MQTT Configuration
+const char* mqtt_broker = "broker.hivemq.com";
+const int mqtt_port = 1883;
+const char* mqtt_client_id = "ESP32_Balance_Device";
 
-def setup_google_sheets():
-    global gc, worksheet
-    try:
-        gc = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
-        sh = gc.open(SPREADSHEET_NAME)
-        worksheet = sh.sheet1
-        print(f"Connected to Google Sheet: {SPREADSHEET_NAME}")
-        return True
-    except Exception as e:
-        print(f"[CRITICAL] Google Sheets setup failed: {e}")
-        return False
+// MQTT Topics
+const char* TOPIC_CMD = "cs3237/A0277110N/health/cmd";
+const char* TOPIC_DATA = "cs3237/A0277110N/health/data/Balance_Test";
 
-def log_session_data(participant_id: str, age: int, gender: str, balance_duration_s: float) -> bool:
-    ordered = {
-        "participant_id": participant_id,
-        "actual_age": age,
-        "gender": gender,
-        "reaction_time_ms": 0.0,
-        "balance_duration_s": balance_duration_s,
-        "memory_score": 0
+// Sensor and hardware
+Adafruit_MPU6050 mpu;
+const int RESET_BUTTON_PIN = 15;
+
+// Balance detection thresholds - Z-axis modulus (absolute value)
+const float Z_AXIS_THRESHOLD = 7.0;  // |Z| >= 7.0 to START, |Z| < 7.0 to STOP
+
+// Trial state variables
+bool trialRunning = false;
+bool waitingForStart = false;
+unsigned long trialStartTime = 0;
+unsigned long lastMqttCheck = 0;
+const unsigned long MQTT_CHECK_INTERVAL = 50;  // Check MQTT every 50ms
+
+// Participant metadata (received from server)
+String participant_id = "UNKNOWN";
+int participant_age = 0;
+String participant_gender = "O";
+
+// WiFi and MQTT clients
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
+
+// WiFi connection function
+void setup_wifi() {
+  delay(10);
+  DEBUG_PRINTLN("\n[WiFi] Connecting to WiFi...");
+  DEBUG_PRINT("[WiFi] SSID: ");
+  DEBUG_PRINTLN(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    DEBUG_PRINT(".");
+  }
+  
+  DEBUG_PRINTLN("\n[WiFi] Connected!");
+  DEBUG_PRINT("[WiFi] IP Address: ");
+  DEBUG_PRINTLN(WiFi.localIP());
+}
+
+// MQTT callback for incoming messages
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  DEBUG_PRINT("\n[MQTT] Message received on topic: ");
+  DEBUG_PRINTLN(topic);
+  
+  // Parse JSON payload
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+
+  if (error) {
+    DEBUG_PRINT("[MQTT] JSON parse error: ");
+    DEBUG_PRINTLN(error.c_str());
+    return;
+  }
+
+  const char* cmd = doc["cmd"];
+  
+  if (cmd != nullptr) {
+    DEBUG_PRINT("[MQTT] Command received: ");
+    DEBUG_PRINTLN(cmd);
+
+    // Handle SET_META command - store participant info
+    if (strcmp(cmd, "SET_META") == 0) {
+      participant_id = doc["participant_id"].as<String>();
+      participant_age = doc["age"];
+      participant_gender = doc["gender"].as<String>();
+      
+      DEBUG_PRINTLN("[META] Participant metadata received:");
+      DEBUG_PRINT("       ID: ");
+      DEBUG_PRINTLN(participant_id);
+      DEBUG_PRINT("       Age: ");
+      DEBUG_PRINTLN(participant_age);
+      DEBUG_PRINT("       Gender: ");
+      DEBUG_PRINTLN(participant_gender);
     }
-    try:
-        worksheet.append_row(list(ordered.values()), value_input_option="USER_ENTERED")
-        print(f"[GSPREAD] Logged row: {ordered}")
-        return True
-    except Exception as e:
-        print(f"[CRITICAL] Append failed: {e}")
-        return False
+    
+    // Handle START_BALANCE command
+    else if (strcmp(cmd, "START_BALANCE") == 0) {
+      // Reset state completely for new trial
+      trialRunning = false;
+      waitingForStart = true;
+      trialStartTime = 0;
+      
+      DEBUG_PRINTLN("\n========================================");
+      DEBUG_PRINTLN("[TEST] NEW BALANCE TEST ARMED!");
+      DEBUG_PRINTF("[TEST] Waiting for |Z-axis| >= %.1f to start timer...\n", Z_AXIS_THRESHOLD);
+      DEBUG_PRINTLN("[TEST] (Lift your leg to start)");
+      DEBUG_PRINTLN("========================================\n");
+    }
+    
+    // Handle RESET command
+    else if (strcmp(cmd, "RESET") == 0) {
+      trialRunning = false;
+      waitingForStart = false;
+      trialStartTime = 0;
+      DEBUG_PRINTLN("[TEST] System reset received");
+    }
+  }
+}
 
-def on_connect(client, userdata, flags, rc, properties=None):
-    if rc == 0:
-        print("MQTT connected.")
-        client.subscribe(TOPIC_DATA, qos=1)
-        print(f"Subscribed: {TOPIC_DATA}")
-    else:
-        print(f"MQTT connect failed rc={rc}")
+// MQTT reconnection function
+void reconnect_mqtt() {
+  // Only try reconnecting if not currently connected
+  if (!mqtt_client.connected()) {
+    DEBUG_PRINT("[MQTT] Attempting connection to ");
+    DEBUG_PRINT(mqtt_broker);
+    DEBUG_PRINT(":");
+    DEBUG_PRINTLN(mqtt_port);
+    
+    if (mqtt_client.connect(mqtt_client_id)) {
+      DEBUG_PRINTLN("[MQTT] Connected successfully!");
+      
+      // Subscribe to command topic
+      mqtt_client.subscribe(TOPIC_CMD);
+      DEBUG_PRINT("[MQTT] Subscribed to: ");
+      DEBUG_PRINTLN(TOPIC_CMD);
+    } else {
+      DEBUG_PRINT("[MQTT] Connection failed, rc=");
+      DEBUG_PRINTLN(mqtt_client.state());
+      DEBUG_PRINTLN("[MQTT] Will retry on next loop...");
+    }
+  }
+}
 
-def on_message(client, userdata, msg):
-    if msg.topic != TOPIC_DATA:
-        return
-    raw = msg.payload.decode("utf-8", errors="replace").strip()
-    print("=" * 50)
-    print("DATA RECEIVED")
-    print(raw)
-    try:
-        obj = json.loads(raw)
-        if obj.get("test_type") != "balance":
-            print("[SKIP] Non-balance message ignored")
-            print("=" * 50)
-            return
-        pid    = str(obj.get("participant_id", "UNKNOWN"))
-        age    = int(obj.get("age", 0))
-        gender = str(obj.get("gender", "O"))
-        trial  = int(obj.get("trial_index", 1))
-        if "duration_s" in obj:
-            duration_s = float(obj["duration_s"])
-        elif "duration_ms" in obj:
-            duration_s = float(obj["duration_ms"]) / 1000.0
-        else:
-            print("[ERROR] Missing duration field")
-            print("=" * 50)
-            return
+// Publish balance test results to MQTT
+void publish_balance_result(unsigned long duration_ms) {
+  StaticJsonDocument<256> doc;
+  
+  doc["participant_id"] = participant_id;
+  doc["age"] = participant_age;
+  doc["gender"] = participant_gender;
+  doc["duration_ms"] = duration_ms;
+  doc["test_type"] = "balance";
+  doc["timestamp"] = millis();
+  
+  char jsonBuffer[256];
+  serializeJson(doc, jsonBuffer);
+  
+  DEBUG_PRINTLN("\n[RESULT] Publishing balance test result:");
+  DEBUG_PRINT("         Duration: ");
+  DEBUG_PRINT(duration_ms);
+  DEBUG_PRINTLN(" ms");
+  DEBUG_PRINT("         JSON: ");
+  DEBUG_PRINTLN(jsonBuffer);
+  
+  // Ensure MQTT is connected before publishing
+  if (!mqtt_client.connected()) {
+    DEBUG_PRINTLN("[RESULT] ERROR: MQTT not connected, reconnecting...");
+    reconnect_mqtt();
+  }
+  
+  if (mqtt_client.connected()) {
+    bool published = mqtt_client.publish(TOPIC_DATA, jsonBuffer, false);
+    
+    if (published) {
+      DEBUG_PRINTLN("[RESULT] Published successfully!");
+    } else {
+      DEBUG_PRINTLN("[RESULT] Publish failed!");
+    }
+  }
+  
+  // Process any incoming MQTT messages immediately
+  mqtt_client.loop();
+}
 
-        print(f"Balance -> ID={pid}, age={age}, gender={gender}, trial={trial}, duration_s={duration_s:.3f}")
-        while True:
-            action = input("Action (SEND to log / DELETE to discard): ").strip().upper()
-            if action == "SEND":
-                ok = log_session_data(pid, age, gender, duration_s)
-                print(f"[LOG] {'OK' if ok else 'FAILED'}")
-                break
-            elif action == "DELETE":
-                print("[LOG] Deleted locally; not appended")
-                break
-            else:
-                print("Invalid input. Type SEND or DELETE.")
+void setup(void) {
+  #if DEBUG
+    Serial.begin(115200);
+    delay(500);
+    DEBUG_PRINTLN("\n\n========================================");
+    DEBUG_PRINTLN("Balance Test System - Z-Axis Modulus");
+    DEBUG_PRINTLN("Multi-Trial Fixed Version");
+    DEBUG_PRINTLN("========================================\n");
+  #endif
 
-        while True:
-            nxt = input("Next trial? (YES to proceed / NO to hold): ").strip().upper()
-            if nxt == "YES":
-                client.publish(TOPIC_CMD, json.dumps({"cmd":"NEXT"}), qos=1)
-                print("[CMD] NEXT sent")
-                break
-            elif nxt == "NO":
-                client.publish(TOPIC_CMD, json.dumps({"cmd":"HOLD"}), qos=1)
-                print("[CMD] HOLD sent")
-                break
-            else:
-                print("Invalid input. Type YES or NO.")
-    except json.JSONDecodeError:
-        print("[ERROR] Payload is not JSON; ignoring")
-    except Exception as e:
-        print(f"[ERROR] Processing failed: {e}")
-    print("=" * 50)
+  // Setup WiFi
+  setup_wifi();
 
-if __name__ == "__main__":
-    if not setup_google_sheets():
-        raise SystemExit(1)
+  // Setup MQTT with larger keepalive
+  mqtt_client.setServer(mqtt_broker, mqtt_port);
+  mqtt_client.setCallback(mqtt_callback);
+  mqtt_client.setKeepAlive(60);  // 60 second keepalive
+  DEBUG_PRINTLN("[MQTT] Client configured");
 
-    # Gather operator inputs and send to device
-    participant_id = input("Participant ID (e.g., P001): ").strip() or "UNKNOWN"
-    age_str = input("Age (number): ").strip() or "0"
-    gender   = input("Gender (M/F/Other): ").strip().upper() or "O"
-    age = int(age_str) if age_str.isdigit() else 0
+  // Try to initialize MPU6050
+  DEBUG_PRINTLN("[MPU6050] Initializing sensor...");
+  if (!mpu.begin()) {
+    DEBUG_PRINTLN("[MPU6050] ERROR: Failed to find MPU6050 chip!");
+    while (1) {
+      delay(10);
+    }
+  }
+  DEBUG_PRINTLN("[MPU6050] Sensor found!");
 
-    client = mqtt.Client(transport="tcp")
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLSv1_2)
-    client.connect(BROKER, PORT, keepalive=60)
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  DEBUG_PRINT("[GPIO] Reset button configured on pin ");
+  DEBUG_PRINTLN(RESET_BUTTON_PIN);
+  
+  // Configure MPU6050
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  DEBUG_PRINTLN("[MPU6050] Accelerometer range: ±8G");
+  
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  DEBUG_PRINTLN("[MPU6050] Gyroscope range: ±500 deg/s");
+  
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  DEBUG_PRINTLN("[MPU6050] Filter bandwidth: 21 Hz");
 
-    # Start network loop
-    client.loop_start()
+  DEBUG_PRINTLN("\n========================================");
+  DEBUG_PRINTLN("Setup complete - System ready!");
+  DEBUG_PRINTF("Threshold: |Z-axis| >= %.1f starts, < %.1f stops\n", 
+               Z_AXIS_THRESHOLD, Z_AXIS_THRESHOLD);
+  DEBUG_PRINTLN("Waiting for START_BALANCE command...");
+  DEBUG_PRINTLN("========================================\n");
+  
+  delay(100);
+}
 
-    # Send metadata and start command
-    meta = {"cmd":"SET_META", "participant_id": participant_id, "age": age, "gender": gender}
-    client.publish(TOPIC_CMD, json.dumps(meta), qos=1)
-    client.publish(TOPIC_CMD, json.dumps({"cmd":"START"}), qos=1)
-    print("[CMD] SET_META and START sent")
+void loop() {
+  // Always maintain MQTT connection (critical!)
+  if (!mqtt_client.connected()) {
+    reconnect_mqtt();
+  }
+  
+  // Process MQTT messages frequently - don't block!
+  mqtt_client.loop();
 
-    # Keep the script running for operator interaction
-    try:
-        while True:
-            pass
-    except KeyboardInterrupt:
-        client.loop_stop()
-        client.disconnect()
+  // Get sensor readings
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  // Calculate absolute value (modulus) of Z-axis acceleration
+  float z_axis_abs = abs(a.acceleration.z);
+
+  // Only run balance detection if START_BALANCE command received
+  if (waitingForStart || trialRunning) {
+    
+    // *** TRIAL START: |Z-axis| >= 7.0 ***
+    if (!trialRunning && waitingForStart) {
+      if (z_axis_abs >= Z_AXIS_THRESHOLD) {
+        // Z-axis modulus exceeded threshold - start timer!
+        trialRunning = true;
+        waitingForStart = false;  // No longer waiting
+        trialStartTime = millis();
+        
+        DEBUG_PRINTLN("[TEST] *** TIMER STARTED ***");
+        DEBUG_PRINTF("[TEST] |Z-axis| = %.2f (threshold: >= %.1f)\n", 
+                     z_axis_abs, Z_AXIS_THRESHOLD);
+        DEBUG_PRINTF("[TEST] Raw Z-axis value: %.2f m/s²\n", a.acceleration.z);
+        DEBUG_PRINTF("[TEST] Start time: %lu ms\n", trialStartTime);
+      }
+    }
+
+    // *** TRIAL STOP: |Z-axis| < 7.0 ***
+    if (trialRunning) {
+      if (z_axis_abs < Z_AXIS_THRESHOLD) {
+        // Z-axis modulus dropped below threshold - stop timer!
+        trialRunning = false;
+        unsigned long trialDuration = millis() - trialStartTime;
+        
+        DEBUG_PRINTLN("[TEST] *** TIMER STOPPED ***");
+        DEBUG_PRINTF("[TEST] |Z-axis| dropped to %.2f (below %.1f)\n", 
+                     z_axis_abs, Z_AXIS_THRESHOLD);
+        DEBUG_PRINTF("[TEST] Raw Z-axis value: %.2f m/s²\n", a.acceleration.z);
+        DEBUG_PRINTF("[TEST] Duration: %lu ms (%.2f seconds)\n", 
+                     trialDuration, trialDuration / 1000.0);
+        
+        // Publish result to MQTT
+        publish_balance_result(trialDuration);
+        
+        // IMPORTANT: Don't set waitingForStart here!
+        // Let the server send START_BALANCE again for next trial
+        DEBUG_PRINTLN("\n[TEST] Trial complete. Ready for next START_BALANCE command.");
+        DEBUG_PRINTLN("========================================\n");
+      }
+    }
+  }
+
+  // Manual reset button
+  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+    trialRunning = false;
+    waitingForStart = false;
+    DEBUG_PRINTLN("[BUTTON] Manual reset triggered!");
+    delay(200);  // debounce
+  }
+
+  // Small delay for stability, but not too long to block MQTT
+  delay(50);  // 20 readings per second, allows MQTT to process
+}
