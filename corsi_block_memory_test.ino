@@ -37,11 +37,11 @@ uint16_t currtouched = 0;
 #define MAX_ERRORS 2
 
 
-
 int ledPins[NUM_BUTTONS] = {12, 13, 14, 15, 16, 17, 18, 19, 26, 27}; // LEDs for each pad
 #define GREEN_LED 33
 #define RED_LED   32
 #define SIGNAL_LED 4
+#define START_BUTTON 23
 
 int sequence[10];
 int userSeq[10];
@@ -50,7 +50,12 @@ int span = 3;          // starting sequence length
 int trialCount = 0;         // trials completed at current span
 int errorsAtSpan = 0;       // number of incorrect trials at current span
 int score = 0;     // score tracker
-bool testRunning = true;
+bool testRunning = false;
+volatile bool startButtonPressed = false;
+
+void IRAM_ATTR toggleTest() {
+  startButtonPressed = true;
+}
 
 void dump_regs() {
   Serial.println("========================================");
@@ -85,7 +90,7 @@ void dump_regs() {
 //generate random sequence
 void generateSequence() {
 
-  Serial.print("Span number: ");
+  Serial.print("\nSpan number: ");
   Serial.println(span);
   Serial.print("Trial number: ");
   Serial.println(trialCount);
@@ -104,7 +109,7 @@ void generateSequence() {
 
 //Play Sequence
 void playSequence() {
-  Serial.print("\n🧩 Playing Sequence: ");
+  Serial.print("\n🧩 Playing Sequence... ");
   for (int i = 0; i < span; i++) {
     int pad = sequence[i];
     digitalWrite(ledPins[pad], HIGH);
@@ -170,19 +175,21 @@ void checkSequence() {
 
     Serial.print("✅ Correct!");
     digitalWrite(GREEN_LED, HIGH);
-    delay(1000);
+    delay(333);
     digitalWrite(GREEN_LED, LOW);
     score++;
 
 
   } else {
-    Serial.print("❌ Wrong sequence!");
+    Serial.println("❌ Wrong sequence!");
     digitalWrite(RED_LED, HIGH);
     delay(333);
     digitalWrite(RED_LED, LOW);
     errorsAtSpan++;
     if (errorsAtSpan >= MAX_ERRORS) {
-    Serial.print("❌ 2 errors in same span! Test ended!");
+    Serial.println("❌ 2 errors in same span! Test ended!");
+    Serial.print("Your Score is: ");
+    Serial.println(score);
     testRunning = false;
     return;
     }
@@ -195,7 +202,9 @@ void checkSequence() {
   else {
 
     if (span >= NUM_BUTTONS) {
-      Serial.print("🎉 Max span reached! Test complete!");
+      Serial.println("🎉 Max span reached! Test complete!");
+      Serial.print("Your Score is: ");
+      Serial.println(score);
       testRunning = false;
       return;
     }
@@ -208,6 +217,21 @@ void checkSequence() {
     Serial.println(span);
 
   }
+}
+
+void resetTrial() {
+    Serial.println("🔄 Trial reset!");
+    testRunning = false;  // stop the trial
+    score = 0;
+    span = 3;
+    trialCount = 0;
+    errorsAtSpan = 0;
+
+    // Turn off all LEDs
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(SIGNAL_LED, LOW);
+    for (int i = 0; i < NUM_BUTTONS; i++) digitalWrite(ledPins[i], LOW);
 }
 
 void setup() {
@@ -243,9 +267,13 @@ void setup() {
     pinMode(ledPins[i], OUTPUT);
     digitalWrite(ledPins[i], LOW);
   }
-  pinMode(32, OUTPUT);
-  pinMode(33, OUTPUT);
-  pinMode(4, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(SIGNAL_LED, OUTPUT);
+
+  //Button setup
+  pinMode(START_BUTTON, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(START_BUTTON), toggleTest, FALLING);
 
   randomSeed(analogRead(34));
   delay(500);
@@ -257,35 +285,47 @@ void loop() {
   // Get the currently touched pads
   currtouched = cap.touched();
 
-  generateSequence();
-  playSequence();
+  if (startButtonPressed) {
+    startButtonPressed = false;
 
-  Serial.print("You can start now");
-  // signal for user to start input
-  digitalWrite(SIGNAL_LED, HIGH);
-
-
-  for (int i = 0; i < span; i++) {
-    userSeq[i] = waitForTouch();
-    Serial.print(userSeq[i]);
-
+    if (!testRunning) {
+      // ----------------------------
+      // This is where testRunning = true
+      // ----------------------------
+      Serial.println("🟢 Test started!");
+      testRunning = true;
+      score = 0;
+      span = 3;
+      trialCount = 0;
+      errorsAtSpan = 0;
+      delay(200); // debounce
+    } else {
+      Serial.println("🔴 Test stopped!");
+      testRunning = false;
+      resetTrial();
+      delay(200); // debounce
+    }
   }
-
-  Serial.print("all done");
   
-  digitalWrite(SIGNAL_LED, LOW);
+  if (testRunning) {
 
-  checkSequence();
-  delay(333);
-  if (!testRunning) {
-    Serial.print("Your Score is: ");
-    Serial.println(score);
-    delay(500);
-    score = 0;
-    span = 3;
-    trialCount = 0;
-    errorsAtSpan = 0;
-    testRunning = true;
+    generateSequence();
+    playSequence();
+
+    Serial.println("Waiting for input:");
+    // signal for user to start input
+    digitalWrite(SIGNAL_LED, HIGH);
+
+
+    for (int i = 0; i < span; i++) {
+      userSeq[i] = waitForTouch();
+
+    }
+    
+    digitalWrite(SIGNAL_LED, LOW);
+
+    checkSequence();
+    delay(333);
   }
 
   // reset our state
