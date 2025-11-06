@@ -1,44 +1,74 @@
-// Final Integrated Code: Reaction Test Station
+// Reaction Time Test with MQTT Integration + LCD Display
+// Set DEBUG to 1 for troubleshooting, 0 for production/standalone
+#define DEBUG 0  // Change to 1 to enable serial output
+
+#if DEBUG
+  #define DEBUG_PRINT(x) Serial.print(x)
+  #define DEBUG_PRINTLN(x) Serial.println(x)
+  #define DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+  #define DEBUG_PRINT(x)
+  #define DEBUG_PRINTLN(x)
+  #define DEBUG_PRINTF(...)
+#endif
+
 #include <Arduino.h>
-#include <Wire.h>              
-#include <LiquidCrystal_I2C.h>  
-#include <WiFi.h>              // Added for Wi-Fi connectivity
-#include <HTTPClient.h>         // Added for HTTP requests
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
-// --- NETWORK CONFIGURATION (CRITICAL: UPDATE THESE) ---
-const char* ssid = "ANNANYA";           // <-- REPLACE with your WiFi name
-const char* password = "hahahaha";   // <-- REPLACE with your WiFi password
-const char* server_ip = "10.30.232.95";        // <-- REPLACE with your Laptop's IP
-const int server_port = 5000;
+// WiFi Configuration
+const char* ssid = "ANNANYA";
+const char* password = ".";
 
-// --- PROJECT CONFIGURATION (Hardcoded for testing P001, Age 22) ---
-const char* participant_id = "P001";
-const int actual_age = 22;
+// MQTT Configuration
+const char* mqtt_broker = "broker.hivemq.com";
+const int mqtt_port = 1883;
+const char* mqtt_client_id = "ESP32_Reaction_Device";
 
-// --- Pin Definitions ---
+// MQTT Topics
+const char* TOPIC_CMD = "cs3237/A0277110N/health/cmd";
+const char* TOPIC_DATA = "cs3237/A0277110N/health/data/Reaction_Test";
+
+// Hardware pins
 const int LED_PIN = 2;   
 const int BUTTON_PIN = 4;
 const int I2C_SDA = 21; 
 const int I2C_SCL = 22;
 
-// --- LCD Object ---
-LiquidCrystal_I2C lcd(0x27, 16, 2); 
+// LCD Object
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// --- Timing and State Variables ---
+// Test configuration
+const int TOTAL_TESTS = 5;
+const unsigned long DEBOUNCE_US = 50000;  // 50ms debounce
+
+// Timing and state variables
 volatile bool led_active = false;      
 volatile bool button_pressed = false; 
 volatile unsigned long start_time_us = 0; 
 volatile unsigned long reaction_time_us = 0; 
-
-const unsigned long DEBOUNCE_US = 50000; 
 volatile unsigned long last_isr_us = 0;
 
-// --- New Variables for Data Logging ---
-const int TOTAL_TESTS = 5;
+// Trial state
+bool waitingForStart = false;
+bool testRunning = false;
 int test_count = 0;
 unsigned long total_reaction_us = 0;
+unsigned long test_times[TOTAL_TESTS];
 
-// --- Interrupt Service Routine (ISR) ---
+// Participant metadata (received from server)
+String participant_id = "UNKNOWN";
+int participant_age = 0;
+String participant_gender = "O";
+
+// WiFi and MQTT clients
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
+
+// Interrupt Service Routine (ISR)
 void IRAM_ATTR buttonISR() {
     unsigned long now_us = micros();
     if ((now_us - last_isr_us) > DEBOUNCE_US) {
@@ -48,157 +78,412 @@ void IRAM_ATTR buttonISR() {
             reaction_time_us = now_us - start_time_us;
             button_pressed = true;
             digitalWrite(LED_PIN, LOW);
+            led_active = false;
         }
     }
 }
 
-// --- Data Transmission Function (NEW) ---
-void sendReactionData(float average_reaction_time_ms) {
-    HTTPClient http;
+// WiFi connection function
+void setup_wifi() {
+    delay(10);
+    DEBUG_PRINTLN("\n[WiFi] Connecting to WiFi...");
+    DEBUG_PRINT("[WiFi] SSID: ");
+    DEBUG_PRINTLN(ssid);
     
-    // Check if WiFi is connected before attempting HTTP
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Error: WiFi disconnected. Cannot send data.");
+    lcd.clear();
+    lcd.print("Connecting WiFi");
+    
+    WiFi.begin(ssid, password);
+    
+    int dots = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        DEBUG_PRINT(".");
+        
+        // Show progress on LCD
+        lcd.setCursor(dots % 16, 1);
+        lcd.print(".");
+        dots++;
+    }
+    
+    DEBUG_PRINTLN("\n[WiFi] Connected!");
+    DEBUG_PRINT("[WiFi] IP Address: ");
+    DEBUG_PRINTLN(WiFi.localIP());
+    
+    lcd.clear();
+    lcd.print("WiFi Connected!");
+    delay(1500);
+}
+
+// MQTT callback for incoming messages
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+    DEBUG_PRINT("\n[MQTT] Message received on topic: ");
+    DEBUG_PRINTLN(topic);
+    
+    // Parse JSON payload
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, payload, length);
+
+    if (error) {
+        DEBUG_PRINT("[MQTT] JSON parse error: ");
+        DEBUG_PRINTLN(error.c_str());
+        lcd.clear();
+        lcd.print("JSON Error!");
         return;
     }
 
-    // Construct the full URL string 
-    // Format: http://<IP>:5000/data?id=<id>&age=<age>&station=reaction&value=<value>
-    String url = "http://";
-    url += server_ip;
-    url += ":" + String(server_port);
-    url += "/data?";
+    const char* cmd = doc["cmd"];
     
-    url += "id=" + String(participant_id);
-    url += "&age=" + String(actual_age); // Send age with the first test
-    url += "&station=reaction";
-    url += "&value=" + String(average_reaction_time_ms, 2); // Value in ms, 2 decimal places
+    if (cmd != nullptr) {
+        DEBUG_PRINT("[MQTT] Command received: ");
+        DEBUG_PRINTLN(cmd);
 
-    Serial.print("Sending Request: ");
-    Serial.println(url);
-    lcd.clear();
-    lcd.print("Sending Data...");
-
-    // Begin connection and send the GET request
-    http.begin(url);
-    int httpResponseCode = http.GET();
-
-    if (httpResponseCode > 0) {
-        // HTTP response code 200 is OK
-        String payload = http.getString();
-        Serial.printf("Server Response Code: %d\n", httpResponseCode); 
-        Serial.println("Server Payload: " + payload);
-        
-        // Display server status on LCD
-        lcd.setCursor(0, 1);
-        if (httpResponseCode == 200) {
-             lcd.print("Data SENT (200)");
-        } else {
-             lcd.print("Server Error!");
+        // Handle SET_META command - store participant info
+        if (strcmp(cmd, "SET_META") == 0) {
+            participant_id = doc["participant_id"].as<String>();
+            participant_age = doc["age"];
+            participant_gender = doc["gender"].as<String>();
+            
+            DEBUG_PRINTLN("[META] Participant metadata received:");
+            DEBUG_PRINT("       ID: ");
+            DEBUG_PRINTLN(participant_id);
+            DEBUG_PRINT("       Age: ");
+            DEBUG_PRINTLN(participant_age);
+            DEBUG_PRINT("       Gender: ");
+            DEBUG_PRINTLN(participant_gender);
+            
+            lcd.clear();
+            lcd.print("Participant:");
+            lcd.setCursor(0, 1);
+            lcd.print(participant_id);
+            lcd.print(" Age:");
+            lcd.print(participant_age);
+            delay(2000);
         }
         
-    } else {
-        Serial.printf("HTTP request failed. Error Code: %d\n", httpResponseCode);
-        lcd.setCursor(0, 1);
-        lcd.print("HTTP Fail!");
+        // Handle START_REACTION command
+        else if (strcmp(cmd, "START_REACTION") == 0) {
+            // Reset state completely for new test session
+            waitingForStart = true;
+            testRunning = false;
+            test_count = 0;
+            total_reaction_us = 0;
+            led_active = false;
+            button_pressed = false;
+            
+            DEBUG_PRINTLN("\n========================================");
+            DEBUG_PRINTLN("[TEST] NEW REACTION TIME TEST ARMED!");
+            DEBUG_PRINTF("[TEST] Will run %d trials\n", TOTAL_TESTS);
+            DEBUG_PRINTLN("[TEST] Starting first trial...");
+            DEBUG_PRINTLN("========================================\n");
+            
+            lcd.clear();
+            lcd.print("Reaction Test");
+            lcd.setCursor(0, 1);
+            lcd.print("Starting...");
+            delay(1000);
+        }
+        
+        // Handle RESET command
+        else if (strcmp(cmd, "RESET") == 0) {
+            waitingForStart = false;
+            testRunning = false;
+            test_count = 0;
+            total_reaction_us = 0;
+            led_active = false;
+            button_pressed = false;
+            digitalWrite(LED_PIN, LOW);
+            
+            DEBUG_PRINTLN("[TEST] System reset received");
+            
+            lcd.clear();
+            lcd.print("System Reset");
+            delay(1000);
+            lcd.clear();
+            lcd.print("Ready");
+        }
+    }
+}
+
+// MQTT reconnection function
+void reconnect_mqtt() {
+    if (!mqtt_client.connected()) {
+        DEBUG_PRINT("[MQTT] Attempting connection to ");
+        DEBUG_PRINT(mqtt_broker);
+        DEBUG_PRINT(":");
+        DEBUG_PRINTLN(mqtt_port);
+        
+        lcd.clear();
+        lcd.print("Connecting MQTT");
+        
+        if (mqtt_client.connect(mqtt_client_id)) {
+            DEBUG_PRINTLN("[MQTT] Connected successfully!");
+            
+            // Subscribe to command topic
+            mqtt_client.subscribe(TOPIC_CMD);
+            DEBUG_PRINT("[MQTT] Subscribed to: ");
+            DEBUG_PRINTLN(TOPIC_CMD);
+            
+            lcd.setCursor(0, 1);
+            lcd.print("MQTT Connected!");
+            delay(1000);
+        } else {
+            DEBUG_PRINT("[MQTT] Connection failed, rc=");
+            DEBUG_PRINTLN(mqtt_client.state());
+            DEBUG_PRINTLN("[MQTT] Will retry on next loop...");
+            
+            lcd.setCursor(0, 1);
+            lcd.print("MQTT Failed!");
+        }
+    }
+}
+
+// Publish reaction test results to MQTT
+void publish_reaction_results() {
+    // Calculate average
+    float average_time_us = (float)total_reaction_us / TOTAL_TESTS;
+    float average_time_ms = average_time_us / 1000.0;
+    
+    StaticJsonDocument<512> doc;
+    
+    doc["participant_id"] = participant_id;
+    doc["age"] = participant_age;
+    doc["gender"] = participant_gender;
+    doc["average_reaction_ms"] = average_time_ms;
+    doc["test_type"] = "reaction";
+    doc["num_trials"] = TOTAL_TESTS;
+    doc["timestamp"] = millis();
+    
+    // Add individual trial times
+    JsonArray trials = doc.createNestedArray("trials");
+    for (int i = 0; i < TOTAL_TESTS; i++) {
+        trials.add(test_times[i] / 1000.0);  // Convert to ms
     }
     
-    http.end(); // Close connection
+    char jsonBuffer[512];
+    serializeJson(doc, jsonBuffer);
+    
+    DEBUG_PRINTLN("\n[RESULT] Publishing reaction test results:");
+    DEBUG_PRINT("         Average: ");
+    DEBUG_PRINT(average_time_ms);
+    DEBUG_PRINTLN(" ms");
+    DEBUG_PRINT("         JSON: ");
+    DEBUG_PRINTLN(jsonBuffer);
+    
+    // Display on LCD
+    lcd.clear();
+    lcd.print("Sending Data...");
+    
+    // Ensure MQTT is connected before publishing
+    if (!mqtt_client.connected()) {
+        DEBUG_PRINTLN("[RESULT] ERROR: MQTT not connected, reconnecting...");
+        reconnect_mqtt();
+    }
+    
+    if (mqtt_client.connected()) {
+        bool published = mqtt_client.publish(TOPIC_DATA, jsonBuffer, false);
+        
+        if (published) {
+            DEBUG_PRINTLN("[RESULT] Published successfully!");
+            lcd.setCursor(0, 1);
+            lcd.print("Data Sent!");
+        } else {
+            DEBUG_PRINTLN("[RESULT] Publish failed!");
+            lcd.setCursor(0, 1);
+            lcd.print("Send Failed!");
+        }
+    }
+    
+    delay(2000);
+    
+    // Process any incoming MQTT messages immediately
+    mqtt_client.loop();
 }
 
 void setup() {
-    Serial.begin(115200);
-    pinMode(LED_PIN, OUTPUT);
-    pinMode(BUTTON_PIN, INPUT_PULLUP); 
-    Wire.begin(I2C_SDA, I2C_SCL);
+    #if DEBUG
+        Serial.begin(115200);
+        delay(500);
+        DEBUG_PRINTLN("\n\n========================================");
+        DEBUG_PRINTLN("Reaction Time Test - MQTT Integration");
+        DEBUG_PRINTLN("Multi-Trial Fixed Version");
+        DEBUG_PRINTLN("========================================\n");
+    #endif
 
-    // --- WI-FI CONNECTION SETUP (NEW) ---
-    WiFi.begin(ssid, password);
+    // Setup LCD
+    Wire.begin(I2C_SDA, I2C_SCL);
     lcd.init();
     lcd.backlight();
-    lcd.print("Connecting WiFi");
-    Serial.print("Connecting to WiFi");
-    
-    // Wait until connected
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-        lcd.print(".");
-    }
-    
-    Serial.println("\nWiFi connected.");
-    Serial.print("ESP32 IP address: ");
-    Serial.println(WiFi.localIP());
     lcd.clear();
-    lcd.print("WiFi Connected!");
-    delay(1000);
-    // ------------------------------------
-
-    lcd.clear();
-    lcd.print("Reaction Time Test");
+    lcd.print("Reaction Test");
     lcd.setCursor(0, 1);
-    lcd.print("Starting 5 Tests");
-    delay(2000);
+    lcd.print("Initializing...");
+    delay(1000);
 
+    // Setup hardware
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    digitalWrite(LED_PIN, LOW);
+    
+    // Attach interrupt
     attachInterrupt(BUTTON_PIN, buttonISR, FALLING);
-    Serial.println("System Initialized. Starting tests...");
+    DEBUG_PRINTLN("[HARDWARE] Button interrupt configured");
+
+    // Setup WiFi
+    setup_wifi();
+
+    // Setup MQTT with larger keepalive
+    mqtt_client.setServer(mqtt_broker, mqtt_port);
+    mqtt_client.setCallback(mqtt_callback);
+    mqtt_client.setKeepAlive(60);  // 60 second keepalive
+    DEBUG_PRINTLN("[MQTT] Client configured");
+
+    // Initial connection
+    reconnect_mqtt();
+
+    DEBUG_PRINTLN("\n========================================");
+    DEBUG_PRINTLN("Setup complete - System ready!");
+    DEBUG_PRINTLN("Waiting for START_REACTION command...");
+    DEBUG_PRINTLN("========================================\n");
+    
+    lcd.clear();
+    lcd.print("System Ready");
+    lcd.setCursor(0, 1);
+    lcd.print("Awaiting Cmd...");
+    
+    delay(1000);
 }
 
 void loop() {
-    // Check if 5 tests have been completed
-    if (test_count >= TOTAL_TESTS) {
-        // --- State: Final Results & Data Send (MODIFIED) ---
-        float average_time_us = (float)total_reaction_us / TOTAL_TESTS;
-        float average_time_ms = average_time_us / 1000.0; // Convert to milliseconds
+    // Always maintain MQTT connection (critical!)
+    if (!mqtt_client.connected()) {
+        reconnect_mqtt();
+    }
+    
+    // Process MQTT messages frequently - don't block!
+    mqtt_client.loop();
+
+    // Only run test logic if START_REACTION command received
+    if (waitingForStart || testRunning) {
         
-        // Display final result on Serial
-        Serial.printf("\n--- FINAL RESULTS ---\n");
-        Serial.printf("Average Reaction Time: %.2f ms\n", average_time_ms);
+        // Check if all tests completed
+        if (test_count >= TOTAL_TESTS) {
+            // All tests done - show results on LCD
+            DEBUG_PRINTLN("\n[TEST] *** ALL TRIALS COMPLETE ***");
+            
+            float average_ms = ((float)total_reaction_us / TOTAL_TESTS) / 1000.0;
+            DEBUG_PRINTF("[TEST] Average reaction time: %.2f ms\n", average_ms);
+            
+            // Display final results on LCD
+            lcd.clear();
+            lcd.print("Test Complete!");
+            lcd.setCursor(0, 1);
+            lcd.printf("Avg: %.1f ms", average_ms);
+            delay(3000);
+            
+            // Display individual results
+            DEBUG_PRINTLN("[TEST] Individual trial results:");
+            for (int i = 0; i < TOTAL_TESTS; i++) {
+                DEBUG_PRINTF("       Trial %d: %.2f ms\n", i+1, test_times[i] / 1000.0);
+                
+                lcd.clear();
+                lcd.printf("Trial %d:", i+1);
+                lcd.setCursor(0, 1);
+                lcd.printf("%.1f ms", test_times[i] / 1000.0);
+                delay(1500);
+            }
+            
+            // Publish results to MQTT
+            publish_reaction_results();
+            
+            // Reset to idle state
+            waitingForStart = false;
+            testRunning = false;
+            
+            DEBUG_PRINTLN("\n[TEST] Session complete. Ready for next START_REACTION command.");
+            DEBUG_PRINTLN("========================================\n");
+            
+            lcd.clear();
+            lcd.print("Session Done");
+            lcd.setCursor(0, 1);
+            lcd.print("Awaiting Cmd...");
+        }
         
-        // **!!! SEND DATA TO CLOUD !!!**
-        sendReactionData(average_time_ms);
+        // Start a new trial if ready
+        else if (!led_active && !button_pressed && !testRunning) {
+            DEBUG_PRINTF("\n[TEST] === Starting Trial %d of %d ===\n", test_count + 1, TOTAL_TESTS);
+            DEBUG_PRINTLN("[TEST] Random delay before LED...");
+            
+            // Show trial info on LCD
+            lcd.clear();
+            lcd.printf("Trial %d of %d", test_count + 1, TOTAL_TESTS);
+            lcd.setCursor(0, 1);
+            lcd.print("Get Ready...");
+            
+            // Random delay before showing LED
+            unsigned long random_delay = random(1000, 5000);
+            delay(random_delay);
+            
+            // Turn on LED and start timing
+            digitalWrite(LED_PIN, HIGH);
+            led_active = true;
+            start_time_us = micros();
+            testRunning = true;
+            
+            DEBUG_PRINTLN("[TEST] LED ON - Press button now!");
+            
+            // Update LCD
+            lcd.setCursor(0, 1);
+            lcd.print("PRESS NOW!      ");
+        }
         
-        Serial.println("Session Complete. Holding.");
-        // Stop the loop after displaying final results
-        while(1) delay(10); 
+        // Handle button press
+        if (button_pressed) {
+            test_count++;
+            test_times[test_count - 1] = reaction_time_us;
+            total_reaction_us += reaction_time_us;
+            
+            float reaction_ms = (float)reaction_time_us / 1000.0;
+            
+            DEBUG_PRINTF("[TEST] Trial %d complete: %.2f ms\n", test_count, reaction_ms);
+            
+            // Display result on LCD
+            lcd.clear();
+            lcd.printf("Trial %d Done", test_count);
+            lcd.setCursor(0, 1);
+            lcd.printf("%.1f ms", reaction_ms);
+            
+            // Reset state for next trial
+            testRunning = false;
+            button_pressed = false;
+            reaction_time_us = 0;
+            
+            // Short delay before next trial
+            delay(2000);
+        }
+        
+        // Timeout check - if LED has been on for more than 5 seconds, abort trial
+        if (led_active && (micros() - start_time_us) > 5000000) {
+            DEBUG_PRINTLN("[TEST] Trial timeout - no response!");
+            
+            digitalWrite(LED_PIN, LOW);
+            led_active = false;
+            testRunning = false;
+            
+            // Display timeout on LCD
+            lcd.clear();
+            lcd.print("Trial Timeout!");
+            lcd.setCursor(0, 1);
+            lcd.print("Too slow!");
+            
+            // Record timeout as max value (5000ms)
+            test_times[test_count] = 5000000;
+            total_reaction_us += 5000000;
+            test_count++;
+            
+            delay(2000);
+        }
     }
 
-    if (!led_active && !button_pressed) {
-        // ... (Existing logic for waiting and starting test) ...
-        lcd.setCursor(0, 1);
-        lcd.printf("Test %d of %d", test_count + 1, TOTAL_TESTS); 
-
-        unsigned long random_delay = random(1000, 5000); 
-        delay(random_delay);
-        
-        // --- Start Test ---
-        digitalWrite(LED_PIN, HIGH);
-        led_active = true;
-        start_time_us = micros();
-        
-        lcd.setCursor(0, 1);
-        lcd.print("CLICK NOW!      ");
-    }
-
-    if (button_pressed) {
-        // ... (Existing logic for test finished and result display) ...
-        test_count++;
-        total_reaction_us += reaction_time_us;
-        
-        float reaction_ms = (float)reaction_time_us / 1000.0;
-        
-        lcd.clear();
-        lcd.printf("Test %d Complete", test_count);
-        lcd.setCursor(0, 1);
-        lcd.printf("Time: %.2f ms", reaction_ms);
-
-        Serial.printf("[Test %d] Time: %.2f ms\n", test_count, reaction_ms);
-        
-        // Reset state for the next test
-        led_active = false;
-        button_pressed = false;
-        reaction_time_us = 0;
-        
-        delay(2000); 
-    }
+    delay(10);  // Small delay for stability
 }
