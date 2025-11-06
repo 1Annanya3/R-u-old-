@@ -1,83 +1,160 @@
-import numpy as np
-import matplotlib.pyplot as plt
-import torchvision
-import torchvision.datasets as datasets
-import torchvision.transforms as transforms
-from pathlib import Path
+import os
 import torch
-from torch.utils.data import random_split, DataLoader
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import random_split, DataLoader, Dataset
+from torchvision import transforms
+from PIL import Image
+from tqdm import tqdm
+import matplotlib.pyplot as plt
 
-#parameters
-# lr = 0.0002
-# max_epoch = 8
-# z_dim = 100
-# g_conv_dim = 64
-# d_conv_dim = 64
-# log_step = 100
-# sample_step = 500
-# sample_num = 32
-batch_size = 60
-image_size = 64
+class FacialAgeDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        """
+        Args:
+            root_dir (str): Path to the root dataset folder (containing age folders)
+            transform (callable, optional): Optional transform to be applied
+                                            on a sample.
+        """
+        self.root_dir = root_dir
+        self.transform = transform
+        self.image_paths = []
+        self.labels = []
 
-#directory of images
-img_dir = Path(r"C:\Users\leyih\OneDrive\Desktop\8.7.2024\The Years\Y3\Sem 1\CS3237\Project\archive")
+        # Go through each age folder (001 to 110)
+        for folder_name in sorted(os.listdir(root_dir)):
+            folder_path = os.path.join(root_dir, folder_name)
+            if not os.path.isdir(folder_path):
+                continue  # skip non-folder files
 
-#Transform pipeline
-transform = transforms.Compose(
-    [transforms.Resize(image_size),
-     transforms.ToTensor(),
-     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))])
+            try:
+                age = int(folder_name)
+            except ValueError:
+                continue  # skip invalid folder names
 
-#Target encoding, each folder is an age
-target_transform = transforms.Compose(
-    [transforms.Lambda(lambda x: F.one_hot(torch.tensor(x), 110))])
+            # Collect all images in the folder
+            for img_name in os.listdir(folder_path):
+                if img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    self.image_paths.append(os.path.join(folder_path, img_name))
+                    self.labels.append(age)
 
-#getting the dataset
-images = torchvision.datasets.ImageFolder(img_dir,transform=transform, target_transform = target_transform)
-img_data = datasets.ImageFolder(root=img_dir, transform=transform)
-train_size = int(0.8 * len(img_data))  #80% for training
-test_size = len(img_data) - train_size  #Remaining 20% for testing
-train_dataset, test_dataset = random_split(img_data, [train_size, test_size])
+    def __len__(self):
+        return len(self.image_paths)
 
-#create DataLoader for training and testing data
-train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
-print(f'Training dataset size: {len(train_dataset)}')
-print(f'Test dataset size: {len(test_dataset)}')
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        age = self.labels[idx]
 
-def imshow(img):
-   npimg = img.numpy()
-   plt.imshow(np.transpose(npimg, (1, 2, 0)))
-   plt.show()
+        if self.transform:
+            image = self.transform(image)
 
-dataiter = iter(train_loader)
-pics, labels = next(dataiter)
-#show images
-imshow(torchvision.utils.make_grid(pics))
+        return image, torch.tensor(age, dtype=torch.float)
 
+transform = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                         std=[0.5, 0.5, 0.5])
+])
 
-#after the last convolution layer, flatten output then pass it onto fully connected layer
+dataset = FacialAgeDataset("archive/face_age", transform=transform)
 
-class CNN(nn.Module):
+train_size = int(0.8 * len(dataset))
+test_size = len(dataset) - train_size
+train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+images, ages = next(iter(train_loader))
+# Undo normalization for visualization
+images = images * 0.5 + 0.5
+
+fig, axes = plt.subplots(1, 4, figsize=(12, 4))
+for i in range(4):
+    img = images[i].permute(1, 2, 0)
+    age = ages[i].item()
+    axes[i].imshow(img)
+    axes[i].set_title(f"Age: {int(age)}")
+    axes[i].axis("off")
+plt.show()
+
+class AgeCNN(nn.Module):
     def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
+        super(AgeCNN, self).__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+        )
+
+        self.fc_layers = nn.Sequential(
+            nn.Linear(128 * 16 * 16, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 1)
+        )
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = torch.flatten(x, 1) # flatten all dimensions except batch
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
+        x = self.conv_layers(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc_layers(x)
         return x
 
-model = CNN()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = AgeCNN().to(device)
+
+criterion = nn.MSELoss()  # since age is a continuous value
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+num_epochs = 2
+train_losses = []
+
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+
+    for images, ages in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}"):
+        images, ages = images.to(device), ages.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images).squeeze()
+        loss = criterion(outputs, ages)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+    epoch_loss = running_loss / len(train_loader)
+    train_losses.append(epoch_loss)
+    print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss:.4f}")
+
+model.eval()
+predictions, actuals = [], []
+
+with torch.no_grad():
+    for images, ages in test_loader:
+        images, ages = images.to(device), ages.to(device)
+        outputs = model(images).squeeze()
+        predictions.extend(outputs.cpu().numpy())
+        actuals.extend(ages.cpu().numpy())
+
+# Compute mean absolute error
+mae = sum(abs(p - a) for p, a in zip(predictions, actuals)) / len(actuals)
+print(f"Mean Absolute Error: {mae:.2f} years")
+
+plt.plot(train_losses)
+plt.title("Training Loss over Epochs")
+plt.xlabel("Epoch")
+plt.ylabel("MSE Loss")
+plt.show()
+
