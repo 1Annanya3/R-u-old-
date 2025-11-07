@@ -101,7 +101,7 @@ def log_session_data(participant_id: str, age: int, gender: str, test_type: str,
                 str(participant_id),      # A: participant_id
                 str(age),                 # B: actual_age
                 str(gender),              # C: gender
-                str(value) + " ms",       # D: reaction_time_ms
+                str(value),       # D: reaction_time_ms
                 "NUL",                    # E: balance_duration_s
                 "NUL"                     # F: memory_score
             ]
@@ -113,7 +113,7 @@ def log_session_data(participant_id: str, age: int, gender: str, test_type: str,
                 str(age),
                 str(gender),
                 "NUL",
-                str(value) + " s",        # E: balance_duration_s
+                str(value),        # E: balance_duration_s
                 "NUL"
             ]
             print(f"Logging BALANCE: {participant_id}, Age {age}, {value}s")
@@ -125,7 +125,7 @@ def log_session_data(participant_id: str, age: int, gender: str, test_type: str,
                 str(gender),
                 "NUL",
                 "NUL",
-                str(value) + " points"    # F: memory_score
+                str(value)    # F: memory_score
             ]
             print(f"Logging MEMORY: {participant_id}, Age {age}, {value} points")
 
