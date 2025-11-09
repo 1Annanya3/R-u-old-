@@ -1,0 +1,194 @@
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, PolynomialFeatures, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.linear_model import LinearRegression
+from sklearn.svm import SVR
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import numpy as np
+
+scope = ["https://spreadsheets.google.com/feeds",
+         "https://www.googleapis.com/auth/drive"]
+
+creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
+client = gspread.authorize(creds)
+
+spreadsheet = client.open("CS3237_Health_Assessment_Data")
+sheet = spreadsheet.worksheet("Balance Test (Synthetic)")
+
+data = sheet.get_all_records()
+df = pd.DataFrame(data)
+
+required_columns = ["participant_gender", "balance_duration_s", "actual_age"]
+assert all(col in df.columns for col in required_columns), "Missing required columns."
+
+# data cleaning
+df["balance_duration_s"] = df["balance_duration_s"].astype(str).str.replace(",", "", regex=False).astype(float)
+df["actual_age"] = df["actual_age"].astype(float).astype(int)
+
+X = df[["participant_gender", "balance_duration_s"]]
+y = df["actual_age"]
+
+#split data
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# polynomial regression
+poly_pipeline = Pipeline(steps=[
+    ("preprocessor", ColumnTransformer([
+        ("gender_encoder", OneHotEncoder(categories=[["M","F"]], drop='first'), ["participant_gender"]),
+        ("passthrough", "passthrough", ["balance_duration_s"])
+    ])),
+    ("poly_features", PolynomialFeatures(degree=3, include_bias=False)),
+    ("regressor", LinearRegression())
+])
+
+poly_pipeline.fit(X_train, y_train)
+
+y_pred_poly = poly_pipeline.predict(X_test)
+print("Polynomial Regression R²:", poly_pipeline.score(X_test, y_test))
+print("Polynomial Regression MAE:", mean_absolute_error(y_test, y_pred_poly))
+print("Polynomial Regression RMSE:", np.sqrt(mean_squared_error(y_test, y_pred_poly)))
+
+
+# svr
+# Encode gender and scale features
+X_encoded = pd.get_dummies(df[["participant_gender", "balance_duration_s"]], drop_first=True)
+X_train_enc, X_test_enc, y_train_enc, y_test_enc = train_test_split(X_encoded, y, test_size=0.2, random_state=42)
+
+svr_pipeline = make_pipeline(
+    StandardScaler(),
+    SVR(kernel='rbf', C=100, epsilon=0.1)
+)
+svr_pipeline.fit(X_train_enc, y_train_enc)
+
+y_pred_svr = svr_pipeline.predict(X_test_enc)
+print("SVR R²:", svr_pipeline.score(X_test_enc, y_test_enc))
+print("SVR MAE:", mean_absolute_error(y_test_enc, y_pred_svr))
+print("SVR RMSE:", np.sqrt(mean_squared_error(y_test, y_pred_poly)))
+
+
+def predict_age_poly(gender, balance_duration):
+    input_df = pd.DataFrame([[gender, balance_duration]], columns=["participant_gender", "balance_duration_s"])
+    return poly_pipeline.predict(input_df)[0]
+
+def predict_age_svr(gender, balance_duration):
+    input_df = pd.get_dummies(pd.DataFrame([[gender, balance_duration]], columns=["participant_gender", "balance_duration_s"]), drop_first=True)
+    # Ensure all columns exist
+    for col in X_encoded.columns:
+        if col not in input_df.columns:
+            input_df[col] = 0
+    input_df = input_df[X_encoded.columns]
+    return svr_pipeline.predict(input_df)[0]
+
+def predict_age(gender, balance_duration, model_type="poly"):
+    """
+    Predict age given gender and balance_duration.
+    Constrains balance_duration to the min/max observed in the training data.
+    """
+    # Get min and max from training data
+    min_bd = X["balance_duration_s"].min()
+    max_bd = X["balance_duration_s"].max()
+    
+    # Clamp balance_duration
+    balance_duration = max(min_bd, min(max_bd, balance_duration))
+    
+    # Create input DataFrame
+    input_df = pd.DataFrame({"participant_gender": [gender],
+                             "balance_duration_s": [balance_duration]})
+    
+    if model_type.lower() == "poly":
+        return poly_pipeline.predict(input_df)[0]
+    
+    elif model_type.lower() == "svr":
+        # One-hot encode gender and ensure same columns as training
+        input_encoded = pd.get_dummies(input_df, drop_first=True)
+        for col in X_encoded.columns:
+            if col not in input_encoded.columns:
+                input_encoded[col] = 0
+        input_encoded = input_encoded[X_encoded.columns]
+        return svr_pipeline.predict(input_encoded)[0]
+    
+    else:
+        raise ValueError("model_type must be 'poly' or 'svr'")
+
+
+# example prediction
+example_gender = "F"
+example_balance_duration = 12.3  # seconds
+
+pred_poly = predict_age(example_gender, example_balance_duration, "poly")
+pred_svr = predict_age(example_gender, example_balance_duration, "svr")
+
+print(f"Predicted Age (Polynomial) for {example_gender} with {example_balance_duration}s = {pred_poly:.2f}")
+print(f"Predicted Age (SVR) for {example_gender} with {example_balance_duration}s = {pred_svr:.2f}")
+
+
+# --- polynomial regression graph ---
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Create a smooth range of balance durations
+x_range = np.linspace(df["balance_duration_s"].min(), df["balance_duration_s"].max(), 200)
+
+# Predict ages for both genders using your polynomial model
+pred_f = [predict_age_poly("F", x) for x in x_range]
+pred_m = [predict_age_poly("M", x) for x in x_range]
+
+# --- Plotting ---
+plt.figure(figsize=(8, 6))
+plt.scatter(df[df["participant_gender"] == "F"]["balance_duration_s"],
+            df[df["participant_gender"] == "F"]["actual_age"],
+            color="deeppink", alpha=0.4, label="Female data")
+
+plt.scatter(df[df["participant_gender"] == "M"]["balance_duration_s"],
+            df[df["participant_gender"] == "M"]["actual_age"],
+            color="royalblue", alpha=0.4, label="Male data")
+
+plt.plot(x_range, pred_f, color="darkred", linewidth=2, label="Fitted curve (F)")
+plt.plot(x_range, pred_m, color="navy", linewidth=2, label="Fitted curve (M)")
+
+plt.xlabel("Balance Duration (s)", fontsize=12)
+plt.ylabel("Predicted / Actual Age", fontsize=12)
+plt.title("Polynomial Regression Fit: Balance Duration vs Age", fontsize=14)
+plt.legend()
+plt.grid(True, linestyle="--", alpha=0.5)
+plt.show()
+
+
+# --- svr graph ---
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Create a smooth range of balance durations
+x_range = np.linspace(df["balance_duration_s"].min(), df["balance_duration_s"].max(), 200)
+
+# Predict ages for both genders using your polynomial model
+pred_f = [predict_age_svr("F", x) for x in x_range]
+pred_m = [predict_age_svr("M", x) for x in x_range]
+
+
+# --- Plotting ---
+plt.figure(figsize=(8, 6))
+plt.scatter(df[df["participant_gender"] == "F"]["balance_duration_s"],
+            df[df["participant_gender"] == "F"]["actual_age"],
+            color="deeppink", alpha=0.4, label="Female data")
+
+plt.scatter(df[df["participant_gender"] == "M"]["balance_duration_s"],
+            df[df["participant_gender"] == "M"]["actual_age"],
+            color="royalblue", alpha=0.4, label="Male data")
+
+plt.plot(x_range, pred_f, color="darkred", linewidth=2, label="Fitted curve (F)")
+plt.plot(x_range, pred_m, color="navy", linewidth=2, label="Fitted curve (M)")
+
+plt.xlabel("Balance Duration (s)", fontsize=12)
+plt.ylabel("Predicted / Actual Age", fontsize=12)
+plt.title("SVR: Balance Duration vs Age", fontsize=14)
+plt.legend()
+plt.grid(True, linestyle="--", alpha=0.5)
+plt.show()
+
