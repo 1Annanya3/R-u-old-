@@ -64,8 +64,8 @@ train_size = int(0.8 * len(dataset))
 test_size = len(dataset) - train_size
 train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
 
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
 
 images, ages = next(iter(train_loader))
 # Undo normalization for visualization
@@ -116,7 +116,7 @@ model = AgeCNN().to(device)
 criterion = nn.MSELoss()  # since age is a continuous value
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-num_epochs = 2
+num_epochs = 14
 train_losses = []
 
 for epoch in range(num_epochs):
@@ -138,6 +138,14 @@ for epoch in range(num_epochs):
     train_losses.append(epoch_loss)
     print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss:.4f}")
 
+    save_state = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': epoch_loss,
+    }
+    torch.save(save_state, 'checkpoint.pth')
+
 model.eval()
 predictions, actuals = [], []
 
@@ -157,4 +165,3 @@ plt.title("Training Loss over Epochs")
 plt.xlabel("Epoch")
 plt.ylabel("MSE Loss")
 plt.show()
-
