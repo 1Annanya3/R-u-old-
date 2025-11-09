@@ -2,17 +2,17 @@ Overview
 
 This server receives health test results over MQTT and logs them to Google Sheets. It also predicts cognitive age from Reaction and Memory tests and maintains a LongTerm sheet for longitudinal tracking. 🙂
 
-Supported tests: Reaction, Balance, Memory, Image.
+*Supported tests*: Reaction, Balance, Memory, Image.
 
-Key sheets:
+*Key sheets:*
 
-Memory Test: raw memory rows.
+- Memory Test: raw memory rows.
 
-Predicted_Ages: per‑event predicted ages (Reaction/Balance/Memory/Face/Combined).
+- Predicted_Ages: per‑event predicted ages (Reaction/Balance/Memory/Face/Combined).
 
-LongTerm: one row per participant_id per date with reaction_time_ms, balance_duration_s, memory_score, cognitive_age, real_age, date. 📈
+- LongTerm: one row per participant_id per date with reaction_time_ms, balance_duration_s, memory_score, cognitive_age, real_age, date. 📈
 
-Folder contents
+*Folder contents*
 
 test.py: main server (MQTT, Sheets logging, LongTerm upserts, CLI).
 
