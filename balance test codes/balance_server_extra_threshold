@@ -38,7 +38,7 @@ const int RESET_BUTTON_PIN = 15;
 
 // Balance detection thresholds - Z-axis modulus (absolute value)
 const float Z_AXIS_THRESHOLD = 7.0;  // |Z| >= 7.0 to START, |Z| < 7.0 to STOP
-const float X_AXIS_THRESHOLD = 5.0;   // |X| <= 5.0 to START, |X| > 5.0 to STOP
+const float X_AXIS_THRESHOLD = 6.0;   // |X| <= 5.0 to START, |X| > 5.0 to STOP
 
 // Trial state variables
 bool trialRunning = false;
@@ -271,7 +271,7 @@ void loop() {
   float x_axis_abs = abs(a.acceleration.x);
 
   // Only run balance detection if START_BALANCE command received
-  if (waitingForStart || trialRunning) {
+  if (waitingForStart && trialRunning) {
     
     // *** TRIAL START: |Z-axis| >= 7.0 or |X-axis| <= 5.0 ***
     if (!trialRunning && waitingForStart) {
@@ -291,7 +291,7 @@ void loop() {
 
     // *** TRIAL STOP: |Z-axis| < 7.0 or |X-axis| > 5.0 ***
     if (trialRunning) {
-      if ((z_axis_abs < Z_AXIS_THRESHOLD) || (x_axis_abs > X_AXIS_THRESHOLD)) {
+      if ((z_axis_abs < Z_AXIS_THRESHOLD) && (x_axis_abs > X_AXIS_THRESHOLD)) {
         // stop timer!
         trialRunning = false;
         unsigned long trialDuration = millis() - trialStartTime;
