@@ -2,6 +2,7 @@
 # - Memory_Test: raw row -> 'Memory Test'; predicted age -> 'Predicted_Ages'.Memory
 # - Reaction_Test: predicted age -> 'Predicted_Ages'.Reaction (via JSON equation)
 # - LongTerm: per (participant_id, date) row with reaction/balance/memory/cognitive/real age
+# - Face upload: HTTP endpoint (/upload_face, /upload_face_form) for CNN age; logged to Predicted_Ages + LongTerm
 # - CLI: start <test>, long term analytics <P_ID>, quit
 
 import ssl
@@ -18,6 +19,9 @@ from long_term_analytics import (
     upsert_longterm_row,
     plot_cognitive_vs_real,
 )
+
+# Face HTTP API (runs alongside MQTT loop)
+from face_api import FaceAPI
 
 # Optional memory model pieces (loaded below with try/except)
 from use_forward_mem_model import pipe  # for readiness flag
@@ -144,6 +148,43 @@ def append_predicted_age_to_pred_sheet(participant_id: str,
     except Exception as e:
         print(f"Predicted_Ages append failed: {e}")
         return False
+
+# ======================
+# Face age logging hook for Flask API
+# ======================
+def on_face_age_ready(predicted_age: float):
+    """
+    Called by the Flask API after a face is uploaded and age predicted.
+    Writes to Predicted_Ages (Face) and LongTerm (cognitive_age).
+    Uses current_participant for id/gender/date.
+    """
+    pid = current_participant.get("id", "UNKNOWN")
+    gender = current_participant.get("gender", "O")
+    date_str = current_participant.get("date", "")
+    real_age = current_participant.get("age", "")
+
+    # Predicted_Ages: Face column
+    try:
+        append_predicted_age_to_pred_sheet(pid, face_age=predicted_age)
+    except Exception as e:
+        print(f"Predicted_Ages face append failed: {e}")
+
+    # LongTerm: update cognitive_age for today’s row
+    try:
+        upsert_longterm_row(
+            WS_LONG,
+            participant_id=pid,
+            gender=gender,
+            reaction_time_ms="",
+            balance_duration_s="",
+            memory_score="",
+            cognitive_age=predicted_age,
+            real_age=real_age,
+            date_str=date_str
+        )
+        print(f"LongTerm face age updated: {pid} {date_str} -> {predicted_age:.2f}")
+    except Exception as e:
+        print(f"LongTerm face upsert failed: {e}")
 
 # ======================
 # Unified logger
@@ -318,6 +359,7 @@ def on_message(client, userdata, msg):
                 break
             else:
                 print("Type SEND or DELETE")
+
     except Exception as e:
         print(f"on_message error: {type(e).__name__}: {e}")
 
@@ -365,6 +407,11 @@ def main():
     current_participant["age"] = age
     current_participant["gender"] = gender
     current_participant["date"] = date_str
+
+    # Start the face upload API (runs in background thread)
+    face_api = FaceAPI(on_face_age_ready)
+    face_api.run_async(host="0.0.0.0", port=5000)
+    print("Open from phone (same Wi‑Fi): http://<laptop-local-IP>:5000/upload_face_form")
 
     client = mqtt.Client(transport="tcp")
     client.on_connect = on_connect
