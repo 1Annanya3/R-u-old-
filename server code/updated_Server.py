@@ -186,6 +186,73 @@ def on_face_age_ready(predicted_age: float):
     except Exception as e:
         print(f"LongTerm face upsert failed: {e}")
 
+
+# ======================
+# Combined age with weights
+# ======================
+
+def calculate_weighted_age(data):
+    weights = {
+        "face": 0.2,
+        "memory": 0.3,
+        "balance": 0.3,
+        "reaction": 0.2
+    }
+
+    pid = current_participant.get("id", "UNKNOWN")
+
+    try:
+        weighted = (
+            weights["face"] * float(data["face_age"]) +
+            weights["memory"] * float(data["memory_age"]) +
+            weights["balance"] * float(data["balance_age"]) +
+            weights["reaction"] * float(data["reaction_age"])
+        )
+        data["weighted_age"] = round(weighted, 2)
+        data["timestamp"] = _date.today().isoformat()
+        return data["weighted_age"]
+    except Exception as e:
+        print("Error calculating weighted age:", e)
+        return None
+
+def handle_weighted_age_calc():
+    """Calculate weighted age, show it, and optionally append to Predicted_Ages."""
+    session_data = {
+        "face_age": current_participant.get("face_age"),
+        "memory_age": current_participant.get("memory_age"),
+        "balance_age": current_participant.get("balance_age"),
+        "reaction_age": current_participant.get("reaction_age")
+    }
+
+    pid = current_participant.get("id", "UNKNOWN")
+    gender = current_participant.get("gender", "O")
+    date_str = current_participant.get("date", _date.today().isoformat())
+    real_age = current_participant.get("age", 0)
+
+    weighted_age = calculate_weighted_age(session_data)
+
+    if weighted_age is None:
+        print("Weighted age could not be calculated. Check session data.")
+        return
+
+    print(f"\nCalculated weighted age: {weighted_age}")
+
+    while True:
+        action = input("Action (SEND / DELETE): ").strip().upper()
+        if action == "SEND":
+            try:
+                append_predicted_age_to_pred_sheet(pid, combined_age=weighted_age)
+                print(f"Combined age {weighted_age} appended for {pid}")
+            except Exception as e:
+                print(f"Combined age append failed: {e}")
+            break
+        elif action == "DELETE":
+            print("Discarded weighted age")
+            break
+        else:
+            print("Type SEND or DELETE")
+
+
 # ======================
 # Unified logger
 # ======================
@@ -384,6 +451,7 @@ def publish_command(client, test_type: str):
 # ======================
 # Main
 # ======================
+
 def main():
     print("Starting server...")
     setup_google_sheets()
@@ -428,7 +496,7 @@ def main():
     meta = {"cmd": "SET_META", "participant_id": participant_id, "age": age, "gender": gender}
     client.publish(TOPIC_CMD, json.dumps(meta), qos=1)
 
-    print("\nCommands: start reaction | start balance | start memory | start image | long term analytics <P_ID> | quit")
+    print("\nCommands: start reaction | start balance | start memory | start image | combined age | long term analytics <P_ID> | quit")
     try:
         while True:
             cmd = input("> ").strip().lower()
@@ -437,6 +505,14 @@ def main():
             if cmd.startswith("start "):
                 t = cmd.split(" ", 1)[1]
                 publish_command(client, t)
+                continue
+            if cmd.startswith("combined age"):
+                # Simulate test results, comment out during run
+                current_participant["face_age"] = 30.5
+                current_participant["memory_age"] = 28.0
+                current_participant["balance_age"] = 32.2
+                current_participant["reaction_age"] = 29.8
+                handle_weighted_age_calc()
                 continue
             if cmd.startswith("long term analytics"):
                 parts = cmd.split()
