@@ -193,9 +193,9 @@ def on_face_age_ready(predicted_age: float):
 
 def calculate_weighted_age(data):
     weights = {
-        "face": 0.2,
+        "face": 0.25,
         "memory": 0.3,
-        "balance": 0.3,
+        "balance": 0.25,
         "reaction": 0.2
     }
 
@@ -508,10 +508,10 @@ def main():
                 continue
             if cmd.startswith("combined age"):
                 # Simulate test results, comment out during run
-                current_participant["face_age"] = 30.5
-                current_participant["memory_age"] = 28.0
-                current_participant["balance_age"] = 32.2
-                current_participant["reaction_age"] = 29.8
+                #current_participant["face_age"] = 30.5
+                #current_participant["memory_age"] = 28.0
+                #current_participant["balance_age"] = 32.2
+                #current_participant["reaction_age"] = 29.8
                 handle_weighted_age_calc()
                 continue
             if cmd.startswith("long term analytics"):
