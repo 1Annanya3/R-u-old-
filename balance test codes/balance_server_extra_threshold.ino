@@ -1,303 +1,171 @@
-// Reaction Time Test with MQTT Integration + LCD Display
+// Balance Test with MPU6050 + MQTT Integration (Multi-Trial Fixed)
 // Set DEBUG to 1 for troubleshooting, 0 for production/standalone
-#define DEBUG 0  // Change to 1 to enable serial output
+#define DEBUG 1  // Change to 0 to disable all serial output
+#define DEBUG 1 // Change to 0 to disable all serial output
 
 #if DEBUG
-  #define DEBUG_PRINT(x)   Serial.print(x)
-  #define DEBUG_PRINTLN(x) Serial.println(x)
-  #define DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
-#else
-  #define DEBUG_PRINT(x)
-  #define DEBUG_PRINTLN(x)
-  #define DEBUG_PRINTF(...)
-#endif
-
-#include <Arduino.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-#include <WiFi.h>
-#include <PubSubClient.h>
+  #define DEBUG_PRINT(x) Serial.print(x)
 #include <ArduinoJson.h>
 
 // WiFi Configuration
+const char* ssid = "__";
+const char* password = "__";
+// !!! IMPORTANT: Replace "__" with your actual WiFi credentials !!!
 const char* ssid = "ANNANYA";
-const char* password = ".";
+const char* password = "_______";
 
 // MQTT Configuration
-const char* mqtt_broker   = "broker.hivemq.com";
-const int   mqtt_port     = 1883;
-const char* mqtt_client_id= "ESP32_Reaction_Device";
+const char* mqtt_broker = "broker.hivemq.com";
+const char* TOPIC_DATA = "cs3237/A0277110N/health/data/Balance_Test";
+Adafruit_MPU6050 mpu;
+const int RESET_BUTTON_PIN = 15;
 
-// MQTT Topics
-const char* TOPIC_CMD  = "cs3237/A0277110N/health/cmd";
-const char* TOPIC_DATA = "cs3237/A0277110N/health/data/Reaction_Test";
+// Balance detection thresholds - Z-axis modulus (absolute value)
+const float Z_AXIS_THRESHOLD = 7.0;  // |Z| >= 7.0 to START, |Z| < 7.0 to STOP
+const float X_AXIS_THRESHOLD = 6.0;   // |X| <= 5.0 to START, |X| > 5.0 to STOP
+// Balance detection thresholds
+// Z_AXIS_THRESHOLD = 0.7 (Z modulus threshold, as requested)
+// X_AXIS_THRESHOLD = 0.6 (X modulus threshold, as requested)
+const float Z_AXIS_THRESHOLD = 6; // |Z| >= 0.7 to START, |Z| < 0.7 to STOP
+const float X_AXIS_THRESHOLD = 5; // |X| <= 0.6 to START, |X| > 0.6 to STOP
 
-// Hardware pins
-const int LED_PIN  = 2;
-const int BUTTON_PIN = 4;
-const int I2C_SDA = 21;
-const int I2C_SCL = 22;
-
-// LCD Object
-LiquidCrystal_I2C lcd(0x27, 16, 2);
-
-// Test configuration
-const int TOTAL_TESTS = 5;
-const unsigned long DEBOUNCE_US = 50000;  // 50ms debounce
-
-// Timing and state variables
-volatile bool led_active = false;
-volatile bool button_pressed = false;
-volatile unsigned long start_time_us = 0;
-volatile unsigned long reaction_time_us = 0;
-volatile unsigned long last_isr_us = 0;
-
-// Trial state
+// Trial state variables
+bool trialRunning = false;
 bool waitingForStart = false;
-bool testRunning = false;
-int  test_count = 0;
-unsigned long total_reaction_us = 0;
-unsigned long test_times[TOTAL_TESTS];
+unsigned long trialStartTime = 0;
+unsigned long lastMqttCheck = 0;
+const unsigned long MQTT_CHECK_INTERVAL = 50;  // Check MQTT every 50ms
+const unsigned long MQTT_CHECK_INTERVAL = 50; // Check MQTT every 50ms
 
-// Participant metadata (must come from server)
-String participant_id;         // empty until SET_META received
-int    participant_age = -1;   // -1 means unknown
-String participant_gender;     // empty until SET_META
-bool   meta_ready = false;     // gate to ensure meta received
+// Debugging interval for accelerometer values
+#define ACCEL_DEBUG_INTERVAL 3000 // Output accel values every 3000ms (3 seconds), as requested
+unsigned long lastAccelDebug = 0;
 
-// WiFi and MQTT clients
-WiFiClient espClient;
-PubSubClient mqtt_client(espClient);
-
-// ISR
-void IRAM_ATTR buttonISR() {
-  unsigned long now_us = micros();
-  if ((now_us - last_isr_us) > DEBOUNCE_US) {
-    last_isr_us = now_us;
-    if (led_active) {
-      reaction_time_us = now_us - start_time_us;
-      button_pressed = true;
-      digitalWrite(LED_PIN, LOW);
-      led_active = false;
-    }
-  }
-}
-
-// WiFi
-void setup_wifi() {
-  delay(10);
-  #if DEBUG
-    Serial.println("\n[WiFi] Connecting...");
-    Serial.print("[WiFi] SSID: "); Serial.println(ssid);
-  #endif
-  lcd.clear(); lcd.print("Connecting WiFi");
-  WiFi.begin(ssid, password);
-  int dots = 0;
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    lcd.setCursor(dots % 16, 1); lcd.print(".");
-    dots++;
-  }
-  lcd.clear(); lcd.print("WiFi Connected!"); delay(1000);
-}
-
-// MQTT callback
+// Participant metadata (received from server)
+String participant_id = "UNKNOWN";
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-  StaticJsonDocument<256> doc;
-  DeserializationError error = deserializeJson(doc, payload, length);
-  if (error) {
-    DEBUG_PRINTLN(String("[MQTT] JSON parse error: ") + error.c_str());
-    lcd.clear(); lcd.print("JSON Error!"); return;
-  }
+      participant_gender = doc["gender"].as<String>();
 
-  const char* cmd = doc["cmd"];
-  if (!cmd) return;
-
-  // Receive participant metadata from server
-  if (strcmp(cmd, "SET_META") == 0) {
-    participant_id     = doc["participant_id"].as<String>();
-    participant_age    = doc["age"].isNull() ? -1 : doc["age"].as<int>();
-    participant_gender = doc["gender"].as<String>();
-    meta_ready = (participant_id.length() > 0) && (participant_age >= 0) && (participant_gender.length() > 0);
-
-    DEBUG_PRINTLN("[META] Received from server");
-    DEBUG_PRINT("[META] ID: "); DEBUG_PRINTLN(participant_id);
-    DEBUG_PRINT("[META] Age: "); DEBUG_PRINTLN(participant_age);
-    DEBUG_PRINT("[META] Gender: "); DEBUG_PRINTLN(participant_gender);
-
-    lcd.clear();
-    lcd.print("ID:"); lcd.print(participant_id);
-    lcd.setCursor(0,1);
-    lcd.print("Age:"); lcd.print(participant_age);
-    delay(1200);
-    lcd.clear();
-    lcd.print(meta_ready ? "Meta OK" : "Meta Missing");
-    return;
-  }
-
-  // Start command: only if meta_ready
-  if (strcmp(cmd, "START_REACTION") == 0) {
-    if (!meta_ready) {
-      DEBUG_PRINTLN("[TEST] START blocked: meta not set");
-      lcd.clear(); lcd.print("Set meta first"); return;
+      DEBUG_PRINTLN("[META] Participant metadata received:");
+      DEBUG_PRINT("       ID: ");
+      DEBUG_PRINT("        ID: ");
+      DEBUG_PRINTLN(participant_id);
+      DEBUG_PRINT("       Age: ");
+      DEBUG_PRINT("        Age: ");
+      DEBUG_PRINTLN(participant_age);
+      DEBUG_PRINT("       Gender: ");
+      DEBUG_PRINT("        Gender: ");
+      DEBUG_PRINTLN(participant_gender);
     }
-    waitingForStart = true;
-    testRunning = false;
-    test_count = 0;
-    total_reaction_us = 0;
-    led_active = false;
-    button_pressed = false;
 
-    lcd.clear(); lcd.print("Reaction Test");
-    lcd.setCursor(0,1); lcd.print("Starting...");
-    delay(800);
-    return;
-  }
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 
-  // Reset
-  if (strcmp(cmd, "RESET") == 0) {
-    waitingForStart = false;
-    testRunning = false;
-    test_count = 0;
-    total_reaction_us = 0;
-    led_active = false;
-    button_pressed = false;
-    digitalWrite(LED_PIN, LOW);
-    lcd.clear(); lcd.print("System Reset");
-    delay(800); lcd.clear(); lcd.print(meta_ready ? "Ready" : "Awaiting meta");
-    return;
-  }
-}
-
-// MQTT connect
-void reconnect_mqtt() {
-  if (mqtt_client.connected()) return;
-  lcd.clear(); lcd.print("Connecting MQTT");
-  if (mqtt_client.connect(mqtt_client_id)) {
-    mqtt_client.subscribe(TOPIC_CMD);
-    lcd.setCursor(0,1); lcd.print("MQTT Connected");
-  } else {
-    lcd.setCursor(0,1); lcd.print("MQTT Failed");
-  }
-}
-
-// Publish results
-void publish_reaction_results() {
-  float average_time_us = (float)total_reaction_us / TOTAL_TESTS;
-  float average_time_ms = average_time_us / 1000.0;
-
-  StaticJsonDocument<512> doc;
-  doc["participant_id"]     = participant_id;
-  doc["age"]                = participant_age;
-  doc["gender"]             = participant_gender;
-  doc["average_reaction_ms"]= average_time_ms;
-  doc["test_type"]          = "reaction";
-  doc["num_trials"]         = TOTAL_TESTS;
-  doc["timestamp"]          = millis();
-  JsonArray trials = doc.createNestedArray("trials");
-  for (int i=0;i<TOTAL_TESTS;i++) trials.add(test_times[i]/1000.0);
-
-  char jsonBuffer[512];
+      DEBUG_PRINTLN("\n========================================");
+      DEBUG_PRINTLN("[TEST] NEW BALANCE TEST ARMED!");
+      DEBUG_PRINTF("[TEST] Waiting for |Z-axis| >= %.1f to start timer...\n", Z_AXIS_THRESHOLD);
+      DEBUG_PRINTF("[TEST] Waiting for balance stability break (|Z|>=%.1f OR |X|<=%.1f) to start timer...\n", Z_AXIS_THRESHOLD, X_AXIS_THRESHOLD);
+      DEBUG_PRINTLN("[TEST] (Lift your leg to start)");
+      DEBUG_PRINTLN("========================================\n");
+    }
+void publish_balance_result(unsigned long duration_ms) {
   serializeJson(doc, jsonBuffer);
 
-  if (!mqtt_client.connected()) reconnect_mqtt();
-  if (mqtt_client.connected()) {
-    bool ok = mqtt_client.publish(TOPIC_DATA, jsonBuffer, false);
-    lcd.clear(); lcd.print(ok ? "Data Sent!" : "Send Failed!");
-  }
-  delay(1200);
-  mqtt_client.loop();
-}
+  DEBUG_PRINTLN("\n[RESULT] Publishing balance test result:");
+  DEBUG_PRINT("         Duration: ");
+  DEBUG_PRINT("          Duration: ");
+  DEBUG_PRINT(duration_ms);
+  DEBUG_PRINTLN(" ms");
+  DEBUG_PRINT("         JSON: ");
+  DEBUG_PRINT("          JSON: ");
+  DEBUG_PRINTLN(jsonBuffer);
 
-void setup() {
-  #if DEBUG
-    Serial.begin(115200); delay(300);
-  #endif
-  Wire.begin(I2C_SDA, I2C_SCL);
-  lcd.init(); lcd.backlight();
-  lcd.clear(); lcd.print("Reaction Test");
-  lcd.setCursor(0,1); lcd.print("Initializing...");
-  delay(800);
-
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  digitalWrite(LED_PIN, LOW);
-  attachInterrupt(BUTTON_PIN, buttonISR, FALLING);
-
-  setup_wifi();
+  // Ensure MQTT is connected before publishing
+void setup(void) {
+  // Setup MQTT with larger keepalive
   mqtt_client.setServer(mqtt_broker, mqtt_port);
   mqtt_client.setCallback(mqtt_callback);
-  mqtt_client.setKeepAlive(60);
-  reconnect_mqtt();
+  mqtt_client.setKeepAlive(60);  // 60 second keepalive
+  mqtt_client.setKeepAlive(60); // 60 second keepalive
+  DEBUG_PRINTLN("[MQTT] Client configured");
 
-  lcd.clear(); lcd.print("Awaiting meta");
-}
+  // Try to initialize MPU6050
+void setup(void) {
+  DEBUG_PRINTLN("\n========================================");
+  DEBUG_PRINTLN("Setup complete - System ready!");
+  DEBUG_PRINTF("Threshold: |Z-axis| >= %.1f starts, < %.1f stops\n", 
+               Z_AXIS_THRESHOLD, Z_AXIS_THRESHOLD);
+  DEBUG_PRINTF("Thresholds: START requires (|Z|>=%.1f OR |X|<=%.1f)\n", 
+               Z_AXIS_THRESHOLD, X_AXIS_THRESHOLD);
+  DEBUG_PRINTF("Thresholds: STOP requires (|Z|<%.1f AND |X|>%.1f)\n", 
+               Z_AXIS_THRESHOLD, X_AXIS_THRESHOLD);
+  DEBUG_PRINTLN("Waiting for START_BALANCE command...");
+  DEBUG_PRINTLN("========================================\n");
 
 void loop() {
-  if (!mqtt_client.connected()) reconnect_mqtt();
-  mqtt_client.loop();
+  float z_axis_abs = abs(a.acceleration.z);
+  float x_axis_abs = abs(a.acceleration.x);
 
-  // Do nothing until metadata is set and a START is received
-  if (!(waitingForStart || testRunning)) { delay(10); return; }
-
-  // All tests complete
-  if (test_count >= TOTAL_TESTS) {
-    float average_ms = ((float)total_reaction_us / TOTAL_TESTS) / 1000.0;
-    lcd.clear(); lcd.print("Test Complete!");
-    lcd.setCursor(0,1); lcd.printf("Avg: %.1f ms", average_ms);
-    delay(1500);
-
-    publish_reaction_results();
-
-    waitingForStart = false; testRunning = false;
-    lcd.clear(); lcd.print("Session Done");
-    lcd.setCursor(0,1); lcd.print("Awaiting cmd...");
-    delay(700);
-    return;
+  // *** Debugging: Output accelerometer values every few seconds ***
+  if (DEBUG && (millis() - lastAccelDebug >= ACCEL_DEBUG_INTERVAL)) {
+      DEBUG_PRINT("[DEBUG ACCEL] Raw X: ");
+      DEBUG_PRINT(a.acceleration.x);
+      DEBUG_PRINT(", Raw Y: ");
+      DEBUG_PRINT(a.acceleration.y);
+      DEBUG_PRINT(", Raw Z: ");
+      DEBUG_PRINT(a.acceleration.z);
+      DEBUG_PRINTF(" | Modulus: |Z|=%.2f, |X|=%.2f\n", z_axis_abs, x_axis_abs);
+      lastAccelDebug = millis();
   }
 
-  // Start a new trial
-  if (!led_active && !button_pressed && !testRunning) {
-    lcd.clear(); lcd.printf("Trial %d/%d", test_count + 1, TOTAL_TESTS);
-    lcd.setCursor(0,1); lcd.print("Get Ready...");
-    unsigned long random_delay = random(1000, 5000);
-    delay(random_delay);
+  // Only run balance detection if START_BALANCE command received
+  if (waitingForStart && trialRunning) {
+  if (waitingForStart || trialRunning) {
 
-    digitalWrite(LED_PIN, HIGH);
-    led_active = true;
-    start_time_us = micros();
-    testRunning = true;
-    lcd.setCursor(0,1); lcd.print("PRESS NOW!    ");
+    // *** TRIAL START: |Z-axis| >= 7.0 or |X-axis| <= 5.0 ***
+    // *** TRIAL START: |Z| >= 0.7 or |X| <= 0.6 ***
+    if (!trialRunning && waitingForStart) {
+      if ((z_axis_abs >= Z_AXIS_THRESHOLD) || (x_axis_abs <= X_AXIS_THRESHOLD)){
+      if ((z_axis_abs >= Z_AXIS_THRESHOLD) && (x_axis_abs <= X_AXIS_THRESHOLD)){
+        // start timer!
+        trialRunning = true;
+        waitingForStart = false;  // No longer waiting
+        waitingForStart = false; // No longer waiting
+        trialStartTime = millis();
+
+        DEBUG_PRINTLN("[TEST] *** TIMER STARTED ***");
+        DEBUG_PRINTF("[TEST] |Z-axis| = %.2f (threshold: >= %.1f)\n", 
+                     z_axis_abs, Z_AXIS_THRESHOLD);
+        DEBUG_PRINTF("[TEST] |Z-axis| = %.2f, |X-axis| = %.2f\n", z_axis_abs, x_axis_abs);
+        DEBUG_PRINTF("[TEST] Start condition met: |Z|=%.2f (>=%.1f) or |X|=%.2f (<=%.1f)\n", 
+                     z_axis_abs, Z_AXIS_THRESHOLD, x_axis_abs, X_AXIS_THRESHOLD);
+        DEBUG_PRINTF("[TEST] Start time: %lu ms\n", trialStartTime);
+      }
+    }
+
+    // *** TRIAL STOP: |Z-axis| < 7.0 or |X-axis| > 5.0 ***
+    // *** TRIAL STOP: |Z| < 0.7 AND |X| > 0.6 ***
+    if (trialRunning) {
+      if ((z_axis_abs < Z_AXIS_THRESHOLD) && (x_axis_abs > X_AXIS_THRESHOLD)) {
+        // stop timer!
+        trialRunning = false;
+        unsigned long trialDuration = millis() - trialStartTime;
+
+        DEBUG_PRINTLN("[TEST] *** TIMER STOPPED ***");
+        DEBUG_PRINTF("[TEST] |Z-axis| = %.2f, |X-axis| = %.2f\n", z_axis_abs, x_axis_abs);
+        DEBUG_PRINTF("[TEST] Stop condition met: |Z|=%.2f (<%.1f) AND |X|=%.2f (>%.1f)\n", 
+                     z_axis_abs, Z_AXIS_THRESHOLD, x_axis_abs, X_AXIS_THRESHOLD);
+        DEBUG_PRINTF("[TEST] Duration: %lu ms (%.2f seconds)\n", 
+                     trialDuration, trialDuration / 1000.0);
+
+void loop() {
+    trialRunning = false;
+    waitingForStart = false;
+    DEBUG_PRINTLN("[BUTTON] Manual reset triggered!");
+    delay(200);  // debounce
+    delay(200); // debounce
   }
 
-  // Handle button press
-  if (button_pressed) {
-    test_count++;
-    test_times[test_count - 1] = reaction_time_us;
-    total_reaction_us += reaction_time_us;
-
-    float reaction_ms = reaction_time_us / 1000.0;
-    lcd.clear(); lcd.printf("Trial %d Done", test_count);
-    lcd.setCursor(0,1); lcd.printf("%.1f ms", reaction_ms);
-
-    testRunning = false;
-    button_pressed = false;
-    reaction_time_us = 0;
-    delay(1200);
-  }
-
-  // Timeout after 5s
-  if (led_active && (micros() - start_time_us) > 5000000) {
-    digitalWrite(LED_PIN, LOW);
-    led_active = false;
-    testRunning = false;
-    lcd.clear(); lcd.print("Trial Timeout");
-    lcd.setCursor(0,1); lcd.print("Too slow!");
-    test_times[test_count] = 5000000;
-    total_reaction_us += 5000000;
-    test_count++;
-    delay(1200);
-  }
-
-  delay(10);
+  // Small delay for stability, but not too long to block MQTT
+  delay(50);  // 20 readings per second, allows MQTT to process
+  delay(50); // 20 readings per second, allows MQTT to process
 }
