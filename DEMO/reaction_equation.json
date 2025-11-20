@@ -1,0 +1,21 @@
+{
+  "intercept": -12.03531186172301,
+  "terms": {
+    "gender=F": -4.3659461981361165,
+    "reaction_time_ms": 0.1487539858135746,
+    "gender=F^2": -4.365946198136601,
+    "gender=F reaction_time_ms": 0.0026552972557565063,
+    "reaction_time_ms^2": -5.2398297322814313e-05
+  },
+  "r2_test": 0.34373468271304697,
+  "encoding": {
+    "gender_baseline": "M",
+    "gender_onehot": "F",
+    "feature_order_prepoly": [
+      "gender=F",
+      "reaction_time_ms"
+    ],
+    "poly_degree": 2,
+    "include_bias": false
+  }
+}
